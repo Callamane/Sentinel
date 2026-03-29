@@ -1,0 +1,37 @@
+[package]
+name = "sentinel-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+description = "Resilience primitives for async Rust — circuit breaker, retry, validation, and structured error context."
+repository = "https://github.com/Callamane/sentinel"
+documentation = "https://docs.rs/sentinel-rs"
+readme = "README.md"
+keywords = ["circuit-breaker", "retry", "resilience", "error-handling", "validation"]
+categories = ["asynchronous", "rust-patterns", "web-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+rand = "0.8"
+regex = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
+
+[features]
+default = []
+
+[[example]]
+name = "circuit_breaker"
+path = "examples/circuit_breaker.rs"
+
+[[example]]
+name = "retry"
+path = "examples/retry.rs"
+
+[[example]]
+name = "validation"
+path = "examples/validation.rs"
