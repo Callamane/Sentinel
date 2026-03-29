@@ -1,11 +1,16 @@
 //! Three-state circuit breaker for preventing cascading failures.
 //!
-//! The breaker tracks failures within a sliding time window. Once the failure
-//! count reaches `failure_threshold`, the circuit **opens** and subsequent calls
-//! fail immediately with [`CircuitBreakerError::Open`]. After `timeout` elapses
-//! the circuit moves to **half-open**, allowing a probe request through. If
+//! The breaker tracks failures within a time window. Once the failure count
+//! reaches `failure_threshold`, the circuit **opens** and subsequent calls fail
+//! immediately with [`CircuitBreakerError::Open`]. After `timeout` elapses the
+//! circuit moves to **half-open**, allowing a probe request through. If
 //! `success_threshold` consecutive probes succeed the circuit **closes** again;
 //! any probe failure re-opens it.
+//!
+//! The failure window is a **tumbling window**: when `window` elapses, the
+//! failure counter resets to zero. This is simpler and cheaper than a true
+//! sliding window (which would track individual failure timestamps), and is
+//! sufficient for the vast majority of production use cases.
 //!
 //! An optional [`StateListener`] callback fires on every state transition,
 //! letting you plug in metrics, logging, or alerting without coupling to a
@@ -16,7 +21,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -25,6 +30,7 @@ use tracing::{debug, info, warn};
 
 /// Possible states of a [`CircuitBreaker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CircuitState {
     /// Requests flow through normally. Failures are counted.
     Closed,
@@ -83,30 +89,39 @@ impl Default for CircuitBreakerConfig {
 
 impl CircuitBreakerConfig {
     /// Create a new config with sensible defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Failures required within the window before the circuit opens.
+    ///
+    /// Clamped to a minimum of 1.
+    #[must_use]
     pub fn failure_threshold(mut self, n: usize) -> Self {
-        self.failure_threshold = n;
+        self.failure_threshold = n.max(1);
         self
     }
 
     /// Consecutive successes in half-open state before the circuit closes.
+    ///
+    /// Clamped to a minimum of 1.
+    #[must_use]
     pub fn success_threshold(mut self, n: usize) -> Self {
-        self.success_threshold = n;
+        self.success_threshold = n.max(1);
         self
     }
 
     /// How long the circuit stays open before transitioning to half-open.
+    #[must_use]
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self
     }
 
     /// Sliding window duration for counting failures. When the window expires
-    /// the failure counter resets.
+    /// the failure counter resets (tumbling window semantics).
+    #[must_use]
     pub fn window(mut self, d: Duration) -> Self {
         self.window = d;
         self
@@ -133,12 +148,13 @@ impl CircuitBreakerConfig {
 /// }
 /// ```
 pub trait StateListener: Send + Sync + 'static {
+    /// Called whenever the breaker transitions from one state to another.
     fn on_state_change(&self, name: &str, from: CircuitState, to: CircuitState);
 }
 
 impl<T: StateListener> StateListener for Arc<T> {
     fn on_state_change(&self, name: &str, from: CircuitState, to: CircuitState) {
-        (**self).on_state_change(name, from, to)
+        (**self).on_state_change(name, from, to);
     }
 }
 
@@ -181,26 +197,62 @@ impl Inner {
 
 /// A three-state circuit breaker.
 ///
-/// `CircuitBreaker` is cheaply cloneable (it wraps its state in an `Arc`).
+/// `CircuitBreaker` is cheaply cloneable — it wraps all mutable state in an
+/// [`Arc`] so clones share the same underlying breaker.
 pub struct CircuitBreaker {
     name: String,
     config: CircuitBreakerConfig,
     inner: Arc<RwLock<Inner>>,
+    probe_gate: Arc<Semaphore>,
     listener: Option<Arc<dyn StateListener>>,
 }
 
+impl fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field("name", &self.name)
+            .field("config", &self.config)
+            .field("listener", &self.listener.as_ref().map(|_| "..."))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for CircuitBreaker {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            config: self.config.clone(),
+            inner: Arc::clone(&self.inner),
+            probe_gate: Arc::clone(&self.probe_gate),
+            listener: self.listener.clone(),
+        }
+    }
+}
+
+const _: () = {
+    #[allow(dead_code)]
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[allow(dead_code)]
+    fn assert_all() {
+        assert_send_sync::<CircuitBreaker>();
+    }
+};
+
 impl CircuitBreaker {
     /// Create a new breaker with the given name and config.
+    #[must_use]
     pub fn new(name: impl Into<String>, config: CircuitBreakerConfig) -> Self {
         Self {
             name: name.into(),
             config,
             inner: Arc::new(RwLock::new(Inner::new())),
+            probe_gate: Arc::new(Semaphore::new(1)),
             listener: None,
         }
     }
 
     /// Attach a [`StateListener`] that fires on transitions.
+    #[must_use]
     pub fn with_listener(mut self, listener: impl StateListener) -> Self {
         self.listener = Some(Arc::new(listener));
         self
@@ -226,12 +278,18 @@ impl CircuitBreaker {
     ///
     /// Returns [`CircuitBreakerError::Open`] immediately if the circuit is
     /// open, or [`CircuitBreakerError::Inner`] if the operation itself fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CircuitBreakerError::Open`] when the circuit rejects the
+    /// operation, or [`CircuitBreakerError::Inner`] when the operation returns
+    /// an error.
     pub async fn call<F, Fut, T, E>(&self, op: F) -> Result<T, CircuitBreakerError<E>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        self.acquire_permit().await?;
+        let _probe_permit = self.acquire_permit().await?;
 
         match op().await {
             Ok(val) => {
@@ -247,27 +305,43 @@ impl CircuitBreaker {
 
     /// Force the circuit open.
     pub async fn trip(&self) {
-        let mut inner = self.inner.write().await;
-        let prev = inner.state;
-        if prev != CircuitState::Open {
-            warn!(breaker = %self.name, "manually tripped");
-            inner.state = CircuitState::Open;
-            inner.opened_at = Some(Instant::now());
-            self.notify(prev, CircuitState::Open);
+        let transition = {
+            let mut inner = self.inner.write().await;
+            let prev = inner.state;
+            if prev == CircuitState::Open {
+                None
+            } else {
+                warn!(breaker = %self.name, "manually tripped");
+                inner.state = CircuitState::Open;
+                inner.opened_at = Some(Instant::now());
+                Some((prev, CircuitState::Open))
+            }
+        };
+
+        if let Some((from, to)) = transition {
+            self.notify(from, to);
         }
     }
 
     /// Force the circuit closed and reset counters.
     pub async fn reset(&self) {
-        let mut inner = self.inner.write().await;
-        let prev = inner.state;
-        info!(breaker = %self.name, "manually reset");
-        inner.state = CircuitState::Closed;
-        inner.failures = 0;
-        inner.successes = 0;
-        inner.opened_at = None;
-        if prev != CircuitState::Closed {
-            self.notify(prev, CircuitState::Closed);
+        let transition = {
+            let mut inner = self.inner.write().await;
+            let prev = inner.state;
+            info!(breaker = %self.name, "manually reset");
+            inner.state = CircuitState::Closed;
+            inner.failures = 0;
+            inner.successes = 0;
+            inner.opened_at = None;
+            if prev == CircuitState::Closed {
+                None
+            } else {
+                Some((prev, CircuitState::Closed))
+            }
+        };
+
+        if let Some((from, to)) = transition {
+            self.notify(from, to);
         }
     }
 
@@ -275,7 +349,9 @@ impl CircuitBreaker {
 
     /// Check whether a request is allowed through. Handles the open → half-open
     /// transition when the timeout expires.
-    async fn acquire_permit<E>(&self) -> Result<(), CircuitBreakerError<E>> {
+    async fn acquire_permit<E>(
+        &self,
+    ) -> Result<Option<OwnedSemaphorePermit>, CircuitBreakerError<E>> {
         let mut inner = self.inner.write().await;
 
         // Expire the sliding window if needed.
@@ -285,16 +361,33 @@ impl CircuitBreaker {
         }
 
         match inner.state {
-            CircuitState::Closed | CircuitState::HalfOpen => Ok(()),
+            CircuitState::Closed => Ok(None),
+            CircuitState::HalfOpen => {
+                // Allow only one in-flight probe while half-open.
+                match Arc::clone(&self.probe_gate).try_acquire_owned() {
+                    Ok(permit) => Ok(Some(permit)),
+                    Err(_) => Err(CircuitBreakerError::Open),
+                }
+            }
             CircuitState::Open => {
-                let opened = inner.opened_at.expect("opened_at set when state is Open");
+                let Some(opened) = inner.opened_at else {
+                    inner.opened_at = Some(Instant::now());
+                    return Err(CircuitBreakerError::Open);
+                };
+
                 if opened.elapsed() >= self.config.timeout {
                     info!(breaker = %self.name, "timeout elapsed, transitioning to half-open");
-                    let prev = inner.state;
                     inner.state = CircuitState::HalfOpen;
                     inner.successes = 0;
-                    self.notify(prev, CircuitState::HalfOpen);
-                    Ok(())
+
+                    // First caller after timeout becomes the probe.
+                    let permit = Arc::clone(&self.probe_gate)
+                        .try_acquire_owned()
+                        .map_err(|_| CircuitBreakerError::Open)?;
+                    drop(inner);
+
+                    self.notify(CircuitState::Open, CircuitState::HalfOpen);
+                    Ok(Some(permit))
                 } else {
                     Err(CircuitBreakerError::Open)
                 }
@@ -303,6 +396,7 @@ impl CircuitBreaker {
     }
 
     async fn record_success(&self) {
+        let mut transition = None;
         let mut inner = self.inner.write().await;
         inner.successes += 1;
 
@@ -324,14 +418,20 @@ impl CircuitBreaker {
                     inner.failures = 0;
                     inner.successes = 0;
                     inner.opened_at = None;
-                    self.notify(CircuitState::HalfOpen, CircuitState::Closed);
+                    transition = Some((CircuitState::HalfOpen, CircuitState::Closed));
                 }
             }
             CircuitState::Open => {} // unreachable after acquire_permit
         }
+
+        drop(inner);
+        if let Some((from, to)) = transition {
+            self.notify(from, to);
+        }
     }
 
     async fn record_failure(&self) {
+        let mut transition = None;
         let mut inner = self.inner.write().await;
         inner.failures += 1;
         inner.last_failure = Some(Instant::now());
@@ -346,7 +446,7 @@ impl CircuitBreaker {
                     );
                     inner.state = CircuitState::Open;
                     inner.opened_at = Some(Instant::now());
-                    self.notify(CircuitState::Closed, CircuitState::Open);
+                    transition = Some((CircuitState::Closed, CircuitState::Open));
                 } else {
                     debug!(
                         breaker = %self.name,
@@ -361,9 +461,14 @@ impl CircuitBreaker {
                 inner.state = CircuitState::Open;
                 inner.opened_at = Some(Instant::now());
                 inner.successes = 0;
-                self.notify(CircuitState::HalfOpen, CircuitState::Open);
+                transition = Some((CircuitState::HalfOpen, CircuitState::Open));
             }
             CircuitState::Open => {} // unreachable after acquire_permit
+        }
+
+        drop(inner);
+        if let Some((from, to)) = transition {
+            self.notify(from, to);
         }
     }
 
@@ -379,11 +484,15 @@ impl CircuitBreaker {
 // ---------------------------------------------------------------------------
 
 /// Point-in-time view of circuit breaker internals.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Current state of the circuit.
     pub state: CircuitState,
+    /// Number of failures recorded in the current window.
     pub failures: usize,
+    /// Number of successes recorded (relevant in half-open state).
     pub successes: usize,
+    /// When the last failure occurred, if any.
     pub last_failure: Option<Instant>,
 }
 
@@ -393,6 +502,7 @@ pub struct Snapshot {
 
 /// Error returned by [`CircuitBreaker::call`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CircuitBreakerError<E> {
     /// The circuit is open — the operation was never attempted.
     Open,
@@ -426,6 +536,7 @@ impl<E: std::error::Error + 'static> std::error::Error for CircuitBreakerError<E
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Barrier;
 
     fn fast_config(failures: usize, timeout_ms: u64) -> CircuitBreakerConfig {
         CircuitBreakerConfig::new()
@@ -568,5 +679,44 @@ mod tests {
         assert_eq!(snap.state, CircuitState::Closed);
         assert_eq!(snap.failures, 1);
         assert!(snap.last_failure.is_some());
+    }
+
+    #[tokio::test]
+    async fn half_open_allows_only_one_in_flight_probe() {
+        let cb = Arc::new(CircuitBreaker::new("test", fast_config(1, 20)));
+
+        // One failure opens the circuit.
+        let _ = cb.call(fail).await;
+        assert_eq!(cb.state().await, CircuitState::Open);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let barrier = Arc::new(Barrier::new(3));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let cb = Arc::clone(&cb);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cb.call(|| async {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok::<_, &'static str>(())
+                })
+                .await
+            }));
+        }
+
+        barrier.wait().await;
+
+        let r1 = handles.remove(0).await.expect("task finished");
+        let r2 = handles.remove(0).await.expect("task finished");
+
+        let ok_count = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        let open_count = usize::from(matches!(r1, Err(CircuitBreakerError::Open)))
+            + usize::from(matches!(r2, Err(CircuitBreakerError::Open)));
+
+        assert_eq!(ok_count, 1, "exactly one probe should be in-flight");
+        assert_eq!(open_count, 1, "the concurrent probe should be rejected");
     }
 }

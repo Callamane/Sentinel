@@ -1,3 +1,7 @@
+#![warn(clippy::pedantic)]
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+
 //! # Sentinel
 //!
 //! Resilience primitives for async Rust services.

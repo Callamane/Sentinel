@@ -47,6 +47,7 @@ use tracing::{debug, warn};
 /// # }
 /// ```
 pub trait Retryable {
+    /// Returns `true` if the error is transient and the operation can be retried.
     fn is_retryable(&self) -> bool;
 }
 
@@ -89,35 +90,42 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
+    /// Create a new config with sensible defaults.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Maximum number of attempts (including the first). Must be >= 1.
+    #[must_use]
     pub fn max_attempts(mut self, n: usize) -> Self {
         self.max_attempts = n.max(1);
         self
     }
 
     /// Base delay before the first retry.
+    #[must_use]
     pub fn initial_delay(mut self, d: Duration) -> Self {
         self.initial_delay = d;
         self
     }
 
     /// Upper bound on the computed delay.
+    #[must_use]
     pub fn max_delay(mut self, d: Duration) -> Self {
         self.max_delay = d;
         self
     }
 
     /// Exponential growth factor applied after each attempt.
+    #[must_use]
     pub fn multiplier(mut self, m: f64) -> Self {
         self.multiplier = m;
         self
     }
 
     /// Fraction of the delay added as random jitter (0.0–1.0).
+    #[must_use]
     pub fn jitter(mut self, j: f64) -> Self {
         self.jitter = j.clamp(0.0, 1.0);
         self
@@ -125,8 +133,9 @@ impl RetryConfig {
 
     /// Compute the delay for a zero-indexed retry attempt.
     fn delay_for(&self, attempt: usize) -> Duration {
-        let base = self.initial_delay.as_millis() as f64 * self.multiplier.powi(attempt as i32);
-        let capped = base.min(self.max_delay.as_millis() as f64);
+        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        let base = self.initial_delay.as_secs_f64() * self.multiplier.powi(exponent);
+        let capped = base.min(self.max_delay.as_secs_f64());
 
         let jitter_range = capped * self.jitter;
         let offset = if jitter_range > 0.0 {
@@ -135,7 +144,7 @@ impl RetryConfig {
             0.0
         };
 
-        Duration::from_millis((capped + offset).max(0.0) as u64)
+        Duration::from_secs_f64((capped + offset).max(0.0))
     }
 }
 
@@ -172,13 +181,28 @@ pub struct RetryPolicy {
     config: RetryConfig,
 }
 
+impl Clone for RetryPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+        }
+    }
+}
+
 impl RetryPolicy {
+    /// Create a new policy from the given config.
+    #[must_use]
     pub fn new(config: RetryConfig) -> Self {
         Self { config }
     }
 
     /// Execute `op`, retrying automatically when the error is
     /// [`Retryable::is_retryable`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying operation error when it is non-retryable or when
+    /// all attempts are exhausted.
     pub async fn call<F, Fut, T, E>(&self, mut op: F) -> Result<T, E>
     where
         F: FnMut() -> Fut,
@@ -217,7 +241,7 @@ impl RetryPolicy {
                         attempt,
                         max = self.config.max_attempts,
                         error = %err,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = delay.as_millis(),
                         "retrying"
                     );
                     sleep(delay).await;
@@ -230,6 +254,11 @@ impl RetryPolicy {
     ///
     /// Use this when you can't (or don't want to) implement [`Retryable`] on
     /// the error type.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying operation error when `should_retry` returns
+    /// `false` or when all attempts are exhausted.
     pub async fn call_when<F, Fut, T, E, P>(&self, mut op: F, mut should_retry: P) -> Result<T, E>
     where
         F: FnMut() -> Fut,
@@ -269,7 +298,7 @@ impl RetryPolicy {
                         attempt,
                         max = self.config.max_attempts,
                         error = %err,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = delay.as_millis(),
                         "retrying"
                     );
                     sleep(delay).await;

@@ -24,7 +24,7 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 
 /// A single validation failure tied to a named field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldError {
     /// Name of the field that failed validation.
     pub field: String,
@@ -35,6 +35,8 @@ pub struct FieldError {
 }
 
 impl FieldError {
+    /// Create a new field error.
+    #[must_use]
     pub fn new(
         field: impl Into<String>,
         code: impl Into<String>,
@@ -61,6 +63,8 @@ pub struct ErrorCollector {
 }
 
 impl ErrorCollector {
+    /// Create a new empty collector.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -121,31 +125,37 @@ impl ErrorCollector {
     }
 
     /// `true` when at least one error has been recorded.
+    #[must_use]
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
 
     /// Number of errors recorded.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.errors.len()
     }
 
     /// `true` when no errors have been recorded.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.errors.is_empty()
     }
 
     /// All errors in insertion order.
+    #[must_use]
     pub fn errors(&self) -> &[FieldError] {
         &self.errors
     }
 
     /// Errors for a single field, if any.
+    #[must_use]
     pub fn field_errors(&self, field: &str) -> Option<&Vec<String>> {
         self.by_field.get(field)
     }
 
     /// Every field → messages mapping.
+    #[must_use]
     pub fn all_field_errors(&self) -> &HashMap<String, Vec<String>> {
         &self.by_field
     }
@@ -162,6 +172,11 @@ impl ErrorCollector {
     }
 
     /// Convert into `Ok(())` when clean, or `Err(ValidationError)` when dirty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when at least one field error has been
+    /// collected.
     pub fn finish(self) -> Result<(), ValidationError> {
         if self.has_errors() {
             Err(ValidationError::from_collector(self))
@@ -186,11 +201,13 @@ pub struct ValidationError {
 
 impl ValidationError {
     /// Wrap an already-populated collector.
+    #[must_use]
     pub fn from_collector(collector: ErrorCollector) -> Self {
         Self { collector }
     }
 
     /// Convenience: create an error with a single field failure.
+    #[must_use]
     pub fn single(field: impl Into<String>, message: impl Into<String>) -> Self {
         let mut collector = ErrorCollector::new();
         collector.add(field, "validation_error", message);
@@ -198,16 +215,19 @@ impl ValidationError {
     }
 
     /// All errors in insertion order.
+    #[must_use]
     pub fn errors(&self) -> &[FieldError] {
         self.collector.errors()
     }
 
     /// Every field → messages mapping.
+    #[must_use]
     pub fn field_errors(&self) -> &HashMap<String, Vec<String>> {
         self.collector.all_field_errors()
     }
 
     /// Consume the error to get the underlying collector back.
+    #[must_use]
     pub fn into_collector(self) -> ErrorCollector {
         self.collector
     }
@@ -280,6 +300,9 @@ pub mod validators {
     }
 
     /// Fails when the value does not match the regex.
+    ///
+    /// Requires the `regex` feature (enabled by default).
+    #[cfg(feature = "regex")]
     pub fn pattern(
         value: &str,
         pat: &regex::Regex,

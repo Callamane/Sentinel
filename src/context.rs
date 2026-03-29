@@ -25,9 +25,17 @@ use tracing::Span;
 /// `Result<T, E>` where `E: Error + Send + Sync + 'static`.
 pub trait WithContext<T> {
     /// Attach a static message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorContext`] when the original result is `Err`.
     fn context(self, msg: impl Into<String>) -> Result<T, ErrorContext>;
 
     /// Attach a lazily-computed message (evaluated only on error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorContext`] when the original result is `Err`.
     fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T, ErrorContext>;
 }
 
@@ -56,6 +64,7 @@ pub struct ErrorContext {
 
 impl ErrorContext {
     /// Wrap an existing error, capturing the current span's trace ID.
+    #[must_use]
     pub fn wrap<E: std::error::Error + Send + Sync + 'static>(error: E) -> Self {
         Self {
             source: Some(Box::new(error)),
@@ -66,6 +75,7 @@ impl ErrorContext {
     }
 
     /// Create a context from a message alone (no underlying source error).
+    #[must_use]
     pub fn from_message(msg: impl Into<String>) -> Self {
         Self {
             source: None,
@@ -76,30 +86,34 @@ impl ErrorContext {
     }
 
     /// Set or replace the human-readable message.
+    #[must_use]
     pub fn message(mut self, msg: impl Into<String>) -> Self {
         self.msg = Some(msg.into());
         self
     }
 
     /// Attach an arbitrary key-value pair for structured logging.
+    #[must_use]
     pub fn meta(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.push((key.into(), value.into()));
         self
     }
 
     /// The trace ID captured at construction time, if any.
+    #[must_use]
     pub fn trace_id(&self) -> Option<&str> {
         self.trace_id.as_deref()
     }
 
     /// All attached metadata pairs.
+    #[must_use]
     pub fn metadata(&self) -> &[(String, String)] {
         &self.metadata
     }
 }
 
 fn current_trace_id() -> Option<String> {
-    Span::current().id().map(|id| format!("{:?}", id))
+    Span::current().id().map(|id| format!("{id:?}"))
 }
 
 impl fmt::Display for ErrorContext {

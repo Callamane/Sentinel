@@ -29,7 +29,7 @@ async fn main() {
         let result = breaker
             .call(|| {
                 let count = Arc::clone(&count);
-                async move { flaky_service(&count).await }
+                async move { flaky_service(&count) }
             })
             .await;
 
@@ -37,6 +37,7 @@ async fn main() {
             Ok(val) => println!("[{i:>2}] success: {val}"),
             Err(CircuitBreakerError::Open) => println!("[{i:>2}] rejected (circuit open)"),
             Err(CircuitBreakerError::Inner(e)) => println!("[{i:>2}] failed: {e}"),
+            Err(_) => println!("[{i:>2}] unexpected error"),
         }
 
         let snap = breaker.snapshot().await;
@@ -49,7 +50,7 @@ async fn main() {
     }
 }
 
-async fn flaky_service(count: &AtomicUsize) -> Result<&'static str, String> {
+fn flaky_service(count: &AtomicUsize) -> Result<&'static str, String> {
     let n = count.fetch_add(1, Ordering::SeqCst);
     if n < 3 {
         Err(format!("transient failure #{n}"))

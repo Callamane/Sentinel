@@ -22,7 +22,7 @@ fn main() {
             eprintln!();
 
             // Programmatic access
-            for (field, messages) in err.field_errors().iter() {
+            for (field, messages) in err.field_errors() {
                 eprintln!("  {field}:");
                 for m in messages {
                     eprintln!("    - {m}");

@@ -62,5 +62,5 @@ async fn main() {
     let result = policy
         .call(|| async { Err::<i32, _>(ApiError("bad request")) })
         .await;
-    println!("non-retryable: {:?}", result);
+    println!("non-retryable: {result:?}");
 }
